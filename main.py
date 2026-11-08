@@ -4,6 +4,7 @@ import uuid
 import random
 import asyncio
 import httpx
+import re
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -25,6 +26,20 @@ WAIT_PHRASES = [
     "Загружаю ответ из глубин подсознания...",
     "Так, сейчас найду нужную информацию в своих терабайтах..."
 ]
+
+# Словарь для распознавания числительных прописью
+WORD_TO_NUM = {
+    "один": 1, "первый": 1, "одному": 1, "первого": 1,
+    "два": 2, "второй": 2, "двум": 2, "второго": 2,
+    "три": 3, "третий": 3, "трем": 3, "третьего": 3,
+    "четыре": 4, "четвертый": 4, "четырем": 4, "четвертого": 4,
+    "пять": 5, "пятый": 5, "пяти": 5, "пятого": 5,
+    "шесть": 6, "шестой": 6, "шести": 6, "шестого": 6,
+    "семь": 7, "седьмой": 7, "семи": 7, "седьмого": 7,
+    "восемь": 8, "восьмой": 8, "восьми": 8, "восьмого": 8,
+    "девять": 9, "девятый": 9, "девяти": 9, "девятого": 9,
+    "десять": 10, "десятый": 10, "десяти": 10, "десятого": 10
+}
 
 # --- ФУНКЦИИ РАБОТЫ С ПАМЯТЬЮ ---
 def load_data():
@@ -88,6 +103,20 @@ def add_message_to_active_chat(user_id, role, content):
         chat["title"] = content[:30] + ("..." if len(content) > 30 else "")
         
     save_data(data)
+
+def extract_number_from_text(text):
+    """Пытается найти число в тексте (цифрой или прописью)."""
+    text = text.lower()
+    
+    # Заменяем слова на цифры
+    for word, num in WORD_TO_NUM.items():
+        text = re.sub(r'\b' + word + r'\b', str(num), text)
+        
+    # Ищем первую попавшуюся цифру
+    match = re.search(r'\b(\d+)\b', text)
+    if match:
+        return int(match.group(1))
+    return None
 # -----------------------------------
 
 @app.post("/")
@@ -99,10 +128,12 @@ async def main(request: Request):
     user_text = body.get("request", {}).get("original_utterance", "").strip()
     payload = body.get("request", {}).get("payload")
 
-    # --- ОБРАБОТКА КОМАНД УПРАВЛЕНИЯ ЧАТАМИ ---
+    # --- БЛОК УПРАВЛЕНИЯ ЧАТАМИ ---
+    
+    text_lower = user_text.lower()
     
     # 1. Создание нового чата
-    if user_text.lower() in ["новый чат", "новый диалог", "начнем сначала", "очисти память"]:
+    if text_lower in ["новый чат", "новый диалог", "начнем сначала", "очисти память"]:
         create_new_chat(user_id)
         return {
             "version": body["version"],
@@ -111,7 +142,7 @@ async def main(request: Request):
         }
 
     # 2. Список чатов
-    if user_text.lower() in ["мои чаты", "список чатов", "какие есть чаты"]:
+    if text_lower in ["мои чаты", "список чатов", "какие есть чаты"]:
         data = load_data()
         user_data = get_user_data(data, user_id)
         chats = user_data["chats"]
@@ -130,7 +161,7 @@ async def main(request: Request):
             chat_list_text += f"{i}. {title}. "
             buttons.append({"title": f"Чат {i}", "payload": f"switch_chat_{chat_id}", "hide": False})
             
-        chat_list_text += " Скажите номер чата или нажмите кнопку."
+        chat_list_text += " Скажите номер чата, чтобы переключиться, или 'Удали чат и номер', чтобы удалить."
         return {
             "version": body["version"],
             "session": body["session"],
@@ -141,7 +172,45 @@ async def main(request: Request):
             }
         }
 
-    # 3. Переключение по кнопке (Payload)
+    # 3. Удаление чата ("Удали чат 2", "Удали второй диалог")
+    if "удали" in text_lower and ("чат" in text_lower or "диалог" in text_lower):
+        chat_num = extract_number_from_text(text_lower)
+        
+        if chat_num is not None:
+            chat_index = chat_num - 1
+            data = load_data()
+            user_data = get_user_data(data, user_id)
+            chats = list(user_data["chats"].items())
+            
+            if 0 <= chat_index < len(chats):
+                chat_id, chat_info = chats[chat_index]
+                title = chat_info["title"]
+                
+                # Удаляем чат
+                del user_data["chats"][chat_id]
+                
+                # Если удалили активный чат, нужно сбросить или выбрать другой
+                if user_data.get("active_chat") == chat_id:
+                    if user_data["chats"]:
+                        # Делаем активным первый попавшийся чат
+                        user_data["active_chat"] = list(user_data["chats"].keys())[0]
+                    else:
+                        user_data["active_chat"] = None
+                        
+                save_data(data)
+                return {
+                    "version": body["version"],
+                    "session": body["session"],
+                    "response": {"text": f"Чат «{title}» успешно удален.", "end_session": False}
+                }
+            else:
+                return {
+                    "version": body["version"],
+                    "session": body["session"],
+                    "response": {"text": f"Чата с номером {chat_num} нет в списке.", "end_session": False}
+                }
+
+    # 4. Переключение по кнопке (Payload)
     if payload and payload.startswith("switch_chat_"):
         chat_id = payload.replace("switch_chat_", "")
         data = load_data()
@@ -157,12 +226,14 @@ async def main(request: Request):
                 "response": {"text": f"Переключилась на диалог: {title}. Продолжаем?", "end_session": False}
             }
 
-    # 4. Переключение голосом ("Чат 1", "Включи чат 2")
-    if user_text.lower().startswith("чат ") or user_text.lower().startswith("переключись на чат "):
-        try:
-            num_str = user_text.lower().replace("переключись на чат ", "").replace("чат ", "").strip()
-            chat_index = int(num_str) - 1
-            
+    # 5. Переключение голосом ("Включи второй чат")
+    if "чат" in text_lower or "диалог" in text_lower:
+        # Защита от ложного срабатывания, если человек просто болтает про чаты, 
+        # но команда на переключение подразумевает наличие цифры.
+        chat_num = extract_number_from_text(text_lower)
+        
+        if chat_num is not None:
+            chat_index = chat_num - 1
             data = load_data()
             user_data = get_user_data(data, user_id)
             chats = list(user_data["chats"].items())
@@ -174,21 +245,19 @@ async def main(request: Request):
                 return {
                     "version": body["version"],
                     "session": body["session"],
-                    "response": {"text": f"Переключилась на диалог: {chat_info['title']}. Продолжаем?", "end_session": False}
+                    "response": {"text": f"Переключилась на диалог номер {chat_num}: {chat_info['title']}. Продолжаем?", "end_session": False}
                 }
             else:
                 return {
                     "version": body["version"],
                     "session": body["session"],
-                    "response": {"text": "Чата с таким номером не существует. Скажите 'Мои чаты', чтобы узнать список.", "end_session": False}
+                    "response": {"text": f"Диалога с номером {chat_num} не существует. Скажите 'Мои чаты', чтобы узнать список.", "end_session": False}
                 }
-        except ValueError:
-            pass # Если не смогли распарсить номер, идем дальше как в обычный чат
 
     # --- ОБЫЧНЫЙ ДИАЛОГ ---
 
     # СЦЕНАРИЙ 1: Пользователь жмет кнопку "Продолжить"
-    if user_text.lower() in ["продолжить", "да", "слушаю", "давай"] or payload == "get_answer":
+    if text_lower in ["продолжить", "да", "слушаю", "давай"] or payload == "get_answer":
         if session_id in response_cache:
             final_answer = response_cache.pop(session_id)
             add_message_to_active_chat(user_id, "assistant", final_answer)
